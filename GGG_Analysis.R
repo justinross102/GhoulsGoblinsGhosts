@@ -5,17 +5,21 @@ library(tidymodels)
 library(vroom) # reading and writing file
 library(embed) # target encoding
 library(discrim) # naive bayes
+library(keras)
+library(tensorflow)
+
 
 
 # load in the data --------------------------------------------------------
 
+setwd("~/Documents/BYU/stat348/GhoulsGoblinsGhosts")
 train <- vroom("train.csv") %>% 
   mutate(type = as.factor(type))
 
 test <- vroom("test.csv") # already has 'type' removed
 
 # check NAs
-na_count_train <- colSums(is.na(train)) 
+na_count_train <- colSums(is.na(missSet)) 
 na_count_test <- colSums(is.na(test))
 print(na_count_train)
 print(na_count_test)
@@ -24,6 +28,25 @@ print(na_count_test)
 cor_matrix <- cor(select(train, where(is.numeric)))
 print(cor_matrix)
 
+# imputation practice -----------------------------------------------------
+
+
+missSet <- vroom("trainWithMissingValues.csv")
+columns_with_missing_values <- colnames(missSet)[apply(is.na(missSet), 2, any)]
+print(columns_with_missing_values)
+
+missing_recipe <- recipe(type ~ ., missSet) %>% 
+  step_impute_mean(bone_length, rotting_flesh, hair_length)
+
+knn_impute <- recipe(type ~ ., missSet) %>% 
+  step_impute_knn(bone_length, impute_with = imp_vars(has_soul), neighbors=10) %>% 
+  step_impute_knn(rotting_flesh, impute_with = imp_vars(has_soul), neighbors=10) %>% 
+  step_impute_knn(hair_length, impute_with = imp_vars(has_soul), neighbors=10)
+
+prepped_recipe <- prep(second_try)
+baked <- bake(prepped_recipe, new_data = missSet)
+
+rmse_vec(train[is.na(missSet)], baked[is.na(missSet)])
 
 # format function ---------------------------------------------------------
 
@@ -44,6 +67,12 @@ basic_recipe <- recipe(type ~ ., train) %>%
   step_rm(id) %>% 
   step_normalize(all_numeric_predictors()) %>% 
   step_dummy(color)
+
+nn_recipe <- recipe(type ~ ., data = train) %>%
+  update_role(id, new_role="id") %>%
+  step_mutate(color = as.factor(color)) %>%  # Turn 'color' into a factor
+  step_dummy(color, one_hot = TRUE) %>% # dummy encode 'color'
+  step_range(all_numeric_predictors(), min=0, max=1) # scale to [0,1]
 
 # apply the recipe to the data
 prepped_recipe <- prep(second_recipe)
@@ -153,19 +182,28 @@ predict_and_format(final_knn_wf, test, "./knn_predictions.csv")
 
 # neural networks ---------------------------------------------------------
 
-nn_recipe <- recipe(type ~ ., data = train) %>%
-  update_role(id, new_role="id") %>%
-  step_mutate(color = ) %>% ## Turn color to factor then dummy encode color
-  step_range(all_numeric_predictors(), min=0, max=1) #scale to [0,1]
-
 nn_model <- mlp(hidden_units = tune(),
                 epochs = 50, #or 100 or 250
                 activation="relu") %>%
   set_engine("keras", verbose=0) %>% #verbose = 0 prints off less
   set_mode("classification")
 
-nn_tuneGrid <- grid_regular(hidden_units(range=c(1, maxHiddenUnits)),
+nn_wf <- workflow() %>%
+  add_recipe(nn_recipe) %>%
+  add_model(nn_model)
+
+nn_tuneGrid <- grid_regular(hidden_units(range=c(1, 5)),
                             levels = 5)
+
+nn_folds <- vfold_cv(train, v = 5, repeats = 1)
+
+CV_results <- nn_wf %>%
+  tune_grid(resamples = nn_folds,
+            grid = nn_tuneGrid,
+            metrics = metric_set(accuracy))
+
+nn_bestTune <- CV_results %>%
+  select_best("accuracy")
 
 tuned_nn <- nn_wf %>%
   tune_grid(...)
