@@ -65,8 +65,8 @@ predict_and_format <- function(model, newdata, filename){
 
 basic_recipe <- recipe(type ~ ., train) %>% 
   step_rm(id) %>% 
-  step_normalize(all_numeric_predictors()) %>% 
-  step_dummy(color)
+  step_dummy(color) %>% 
+  step_normalize(all_numeric_predictors())
 
 nn_recipe <- recipe(type ~ ., data = train) %>%
   update_role(id, new_role="id") %>%
@@ -111,12 +111,12 @@ final_forest_wf <- rand_forest_wf %>%
   fit(data = train)
 
 predict_and_format(final_forest_wf, test, "random_forest_predictions.csv")
-# 0.71455
+# 0.72022
 
 # naive bayes -------------------------------------------------------------
 
 nb_mod <- naive_Bayes(Laplace = tune(),
-                                 smoothness = tune()) %>%
+                      smoothness = tune()) %>%
   set_mode("classification") %>%
   set_engine("naivebayes")
 
@@ -179,6 +179,43 @@ final_knn_wf <- knn_workflow %>%
 
 predict_and_format(final_knn_wf, test, "./knn_predictions.csv")
 # 0.70132
+
+
+# svm ---------------------------------------------------------------------
+
+# SVM models
+
+svmRadial <- svm_rbf(rbf_sigma=tune(), cost=tune()) %>% # set or tune
+  set_mode("classification") %>%
+  set_engine("kernlab")
+
+svm_wf <- workflow() %>%
+  add_model(svmRadial) %>%
+  add_recipe(basic_recipe)
+
+# cross validation
+svm_tuning_grid <- grid_regular(cost(),
+                                rbf_sigma(),
+                                levels = 5)
+
+svm_folds <- vfold_cv(train, v = 5, repeats = 1)
+
+## Run the CV
+CV_results <- svm_wf %>%
+  tune_grid(resamples = svm_folds,
+            grid = svm_tuning_grid,
+            metrics = metric_set(accuracy))
+
+svm_bestTune <- CV_results %>%
+  select_best("accuracy")
+
+# finalize workflow
+final_svm_wf <- svm_wf %>%
+  finalize_workflow(svm_bestTune) %>%
+  fit(data = train)
+
+predict_and_format(final_svm_wf, test, "./svmRadial_predictions.csv")
+# 0.72778
 
 # neural networks ---------------------------------------------------------
 
