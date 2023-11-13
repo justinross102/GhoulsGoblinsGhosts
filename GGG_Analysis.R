@@ -5,19 +5,17 @@ library(tidymodels)
 library(vroom) # reading and writing file
 library(embed) # target encoding
 library(discrim) # naive bayes
-library(keras)
-library(tensorflow)
-
 
 
 # load in the data --------------------------------------------------------
 
 setwd("~/Documents/BYU/stat348/GhoulsGoblinsGhosts")
 train <- vroom("train.csv") %>% 
-  mutate(type = as.factor(type))
+  mutate(type = as.factor(type)) %>% 
+  select(-c(color))
 
-test <- vroom("test.csv") # already has 'type' removed
-
+test <- vroom("test.csv") %>%  # already has 'type' removed
+  select(-c(color))
 # check NAs
 na_count_train <- colSums(is.na(missSet)) 
 na_count_test <- colSums(is.na(test))
@@ -63,10 +61,7 @@ predict_and_format <- function(model, newdata, filename){
 
 # recipes -----------------------------------------------------------------
 
-basic_recipe <- recipe(type ~ ., train) %>% 
-  step_rm(id) %>% 
-  step_dummy(color) %>% 
-  step_normalize(all_numeric_predictors())
+basic_recipe <- recipe(type ~ ., train)
 
 nn_recipe <- recipe(type ~ ., data = train) %>%
   update_role(id, new_role="id") %>%
@@ -84,7 +79,7 @@ baked
 
 rand_forest_mod <- rand_forest(mtry = tune(),
                                min_n=tune(),
-                               trees = 3000) %>% 
+                               trees = 1000) %>% 
   set_engine("ranger") %>%
   set_mode("classification")
 
@@ -111,7 +106,7 @@ final_forest_wf <- rand_forest_wf %>%
   fit(data = train)
 
 predict_and_format(final_forest_wf, test, "random_forest_predictions.csv")
-# 0.72022
+# 0.72211
 
 # naive bayes -------------------------------------------------------------
 
@@ -127,9 +122,9 @@ nb_wf <- workflow() %>%
 # cross validation
 nb_tuning_grid <- grid_regular(Laplace(),
                                smoothness(),
-                               levels = 5)
+                               levels = 6)
 
-nb_folds <- vfold_cv(train, v = 5, repeats = 2)
+nb_folds <- vfold_cv(train, v = 6, repeats = 2)
 
 CV_results <- nb_wf %>%
   tune_grid(resamples = nb_folds,
@@ -144,7 +139,7 @@ final_nb_wf <- nb_wf %>%
   fit(data = train)
 
 predict_and_format(final_nb_wf, test, "naive_bayes_preds.csv")
-# 0.72778
+# 0.74291
 
 
 # knn ---------------------------------------------------------------------
@@ -219,22 +214,27 @@ predict_and_format(final_svm_wf, test, "./svmRadial_predictions.csv")
 
 # neural networks ---------------------------------------------------------
 
-nn_model <- mlp(hidden_units = tune(),
-                epochs = 50, #or 100 or 250
-                activation="relu") %>%
-  set_engine("keras", verbose=0) %>% #verbose = 0 prints off less
+nn_recipe <- recipe(type ~ ., data = train) %>%
+  update_role(id, new_role="id") %>%
+  step_mutate(color = as.factor(color)) %>%  # Turn 'color' into a factor
+  step_dummy(color, one_hot = TRUE) %>% # dummy encode 'color'
+  step_range(all_numeric_predictors(), min=0, max=1) # scale to [0,1]
+
+neural_net_model <- mlp(hidden_units = tune(),
+                        epochs = 50) %>%  # or 100 or 250
+  set_engine("nnet") %>% #verbose = 0 prints off less
   set_mode("classification")
 
-nn_wf <- workflow() %>%
+neural_net_wf <- workflow() %>%
   add_recipe(nn_recipe) %>%
-  add_model(nn_model)
+  add_model(neural_net_model)
 
-nn_tuneGrid <- grid_regular(hidden_units(range=c(1, 5)),
+nn_tuneGrid <- grid_regular(hidden_units(range=c(1, 50)),
                             levels = 5)
 
 nn_folds <- vfold_cv(train, v = 5, repeats = 1)
 
-CV_results <- nn_wf %>%
+CV_results <- neural_net_wf %>%
   tune_grid(resamples = nn_folds,
             grid = nn_tuneGrid,
             metrics = metric_set(accuracy))
@@ -242,16 +242,129 @@ CV_results <- nn_wf %>%
 nn_bestTune <- CV_results %>%
   select_best("accuracy")
 
-tuned_nn <- nn_wf %>%
-  tune_grid(...)
+# finalize workflow
+final_neural_net_wf <- neural_net_wf %>%
+  finalize_workflow(nn_bestTune) %>%
+  fit(data = train)
 
-tuned_nn %>% collect_metrics() %>%
+predict_and_format(final_neural_net_wf, test, "./neural_net_predictions.csv")
+# 0.724
+
+plot1 <- CV_results %>% collect_metrics() %>%
   filter(.metric=="accuracy") %>%
-  ggplot(aes(x=hidden_units, y=mean)) + geom_line()
+  ggplot(aes(x=hidden_units, y=mean)) + geom_line() +
+  theme(aspect.ratio = 1)
 
-## CV tune, finalize and predict here and save results
+ggsave(plot = plot1, filename = "nnet_plot.jpg")
+
+# boosting/bart -----------------------------------------------------------
+library(bonsai)
+library(lightgbm)
+library(dbarts)
+
+boosted_model <- boost_tree(tree_depth = tune(),
+                            trees = tune(),
+                            learn_rate = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+boosted_wf <- workflow() %>%
+  add_recipe(basic_recipe) %>%
+  add_model(boosted_model)
+
+boosted_tuneGrid <- grid_regular(tree_depth(),
+                                 trees(),
+                                 learn_rate(),
+                                 levels = 5)
+
+folds <- vfold_cv(train, v = 10, repeats = 1)
+
+bart_model <- parsnip::bart(trees = tune()) %>% 
+  set_engine("dbarts") %>% 
+  set_mode("classification")
+
+bart_wf <- workflow() %>% 
+  add_recipe(basic_recipe) %>% 
+  add_model(bart_model)
+
+bart_tuneGrid <- grid_regular(trees(),
+                              levels = 5)
+
+# boosted CV results
+CV_results <- boosted_wf %>%
+  tune_grid(resamples = folds,
+            grid = boosted_tuneGrid,
+            metrics = metric_set(accuracy))
+
+boosted_bestTune <- CV_results %>%
+  select_best("accuracy")
+
+# bart CV results
+CV_results <- bart_wf %>%
+  tune_grid(resamples = folds,
+            grid = bart_tuneGrid,
+            metrics = metric_set(accuracy))
+
+bart_bestTune <- CV_results %>% 
+  select_best("accuracy")
+
+# finalize workflows
+final_boosted_wf <- boosted_wf %>%
+  finalize_workflow(boosted_bestTune) %>%
+  fit(data = train)
+
+final_bart_wf <- bart_wf %>% 
+  finalize_workflow(bart_bestTune) %>% 
+  fit(data = train)
+
+predict_and_format(final_boosted_wf, test, "boosted_predictions.csv")
+# 0.70699
+
+predict_and_format(final_bart_wf, test, "bart_predictions.csv")
+# 0.56143
 
 
+# stacking ----------------------------------------------------------------
+library(stacks)
+
+folds <- vfold_cv(train, v = 5, repeats=1)
+untunedModel <- control_stack_grid()
+
+rf_models <- rand_forest_wf %>%
+  tune_grid(resamples=folds,
+            grid=rand_forest_tuning_grid,
+            metrics=metric_set(roc_auc),
+            control = untunedModel)
+
+nb_models <- nb_wf %>%
+  tune_grid(resamples=folds,
+            grid=nb_tuning_grid,
+            metrics=metric_set(roc_auc),
+            control = untunedModel)
+
+# Specify with models to include
+my_stack <- stacks() %>%
+  add_candidates(rf_models) %>%
+  add_candidates(nb_models)
+
+## Fit the stacked model
+stack_mod <- my_stack %>%
+  blend_predictions() %>% # LASSO penalized regression meta-learner
+  fit_members() ## Fit the members to the dataset
+
+## Use the stacked data to get a prediction
+
+predictions <- stack_mod %>%
+  predict(new_data = test,
+          type = "class")
+
+submission <- predictions %>% 
+  mutate(id = test$id) %>% 
+  rename("type" = ".pred_class") %>% 
+  select(2,1)
+
+vroom_write(submission, "stacked_predictions.csv", delim = ',')
+# 0.74858
 
 
 
